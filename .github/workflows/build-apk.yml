@@ -1,0 +1,146 @@
+name: Build VoltPulse Release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build, Version & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repo dengan sejarah commit penuh
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Kira Versi (cth: 12 -> 1.0.12, 105 -> 1.0.5) & Jana Release Notes
+      - name: 2. Kira Versi & Sediakan Release Notes
+        id: versioning
+        run: |
+          TOTAL_COMMITS=$(git rev-list --count HEAD)
+          
+          if [ "$TOTAL_COMMITS" -ge 100 ]; then
+            APP_VERSION=$(echo "$TOTAL_COMMITS" | sed 's/\(.\)\(.\)\(.*\)/\1.\2.\3/')
+          else
+            APP_VERSION="1.0.${TOTAL_COMMITS}"
+          fi
+          
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "VERSION_CODE=$TOTAL_COMMITS" >> $GITHUB_ENV
+          echo "Versi APK Dijana: v$APP_VERSION (Build Code: $TOTAL_COMMITS)"
+
+          echo "### VoltPulse v${APP_VERSION}" > release_notes.md
+          echo "Binaan automatik untuk commit build #${TOTAL_COMMITS}." >> release_notes.md
+          echo "" >> release_notes.md
+          echo "#### Perubahan Terkini:" >> release_notes.md
+          git log -10 --pretty=format:"* %s (%h)" >> release_notes.md
+          echo "" >> release_notes.md
+
+      # 3. Setup Java JDK 21
+      - name: 3. Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      # 4. Suntik Versi Dinamik ke dalam app/build.gradle.kts
+      - name: 4. Kemas Kini Versi dalam Gradle
+        run: |
+          GRADLE_FILE="app/build.gradle.kts"
+          if [ -f "$GRADLE_FILE" ]; then
+            echo "Mengemas kini versi ke $APP_VERSION (code: $VERSION_CODE)..."
+            sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/g" "$GRADLE_FILE"
+            sed -i "s/versionName = \".*\"/versionName = \"$APP_VERSION\"/g" "$GRADLE_FILE"
+          fi
+
+      # 5. Jana Gradle Wrapper jika belum ada & Beri Kebenaran
+      - name: 5. Sediakan Gradle Wrapper
+        run: |
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper --gradle-version 8.9
+          fi
+          chmod +x gradlew
+
+      # 6. Compile Release APK
+      - name: 6. Compile Release APK
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # 7. Zipalign & Tandatangan APK
+      - name: 7. Zipalign & Sign APK
+        run: |
+          APK_DIR="app/build/outputs/apk/release"
+          
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          echo "Build-Tools Digunakan: $BUILD_TOOLS"
+
+          UNSIGNED_APK=$(find $APK_DIR -name "*unsigned.apk" -o -name "*-release.apk" | head -n 1)
+
+          $BUILD_TOOLS/zipalign -v -p 4 "$UNSIGNED_APK" "$APK_DIR/aligned.apk"
+
+          FINAL_APK_NAME="VoltPulse-v${APP_VERSION}-signed.apk"
+
+          $BUILD_TOOLS/apksigner sign --ks release.keystore \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --ks-pass pass:"${{ secrets.STORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+            --out "$APK_DIR/$FINAL_APK_NAME" \
+            "$APK_DIR/aligned.apk"
+
+          $BUILD_TOOLS/apksigner verify --verbose "$APK_DIR/$FINAL_APK_NAME"
+
+          echo "SIGNED_APK_PATH=$APK_DIR/$FINAL_APK_NAME" >> $GITHUB_ENV
+          rm -f release.keystore "$APK_DIR/aligned.apk"
+
+      # 8. Muat Naik ke GitHub Releases
+      - name: 8. Cipta GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.APP_VERSION }}"
+          name: "VoltPulse Release v${{ env.APP_VERSION }}"
+          body_path: release_notes.md
+          files: ${{ env.SIGNED_APK_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 9. Kemaskini & Push version.json Secara Automatik ke Repo
+      - name: 9. Kemaskini version.json di GitHub
+        run: |
+          python3 -c '
+          import json, os, subprocess
+          latest_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%s"]).decode().strip()
+          app_ver = os.environ["APP_VERSION"]
+          ver_code = int(os.environ["VERSION_CODE"])
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = {
+              "latestVersion": app_ver,
+              "versionCode": ver_code,
+              "releaseNotes": latest_msg or f"Kemaskini baharu VoltPulse v{app_ver}",
+              "downloadUrl": f"https://github.com/{repo}/releases/download/v{app_ver}/VoltPulse-v{app_ver}-signed.apk"
+          }
+          with open("version.json", "w") as f:
+              json.dump(payload, f, indent=2)
+              f.write("\n")
+          '
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: kemaskini version.json ke v${APP_VERSION} (build ${VERSION_CODE}) [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      # 10. Simpan ke Actions Artifacts
+      - name: 10. Simpan ke Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoltPulse-v${{ env.APP_VERSION }}-APK
+          path: ${{ env.SIGNED_APK_PATH }}
+          retention-days: 14
