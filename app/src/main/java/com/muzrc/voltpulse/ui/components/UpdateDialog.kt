@@ -32,10 +32,7 @@ fun UpdateDialog(
         },
         text = {
             Text(
-                text = "Versi baharu (Build #${updateInfo.versionCode}) tersedia di GitHub.
-
-Nota Keluaran:
-${updateInfo.releaseNotes}",
+                text = "Versi baharu (Build #${updateInfo.versionCode}) tersedia di GitHub.\n\nNota Keluaran:\n${updateInfo.releaseNotes}",
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextPrimary
             )
