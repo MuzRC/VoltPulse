@@ -2,7 +2,7 @@ package com.muzrc.voltpulse.core.shizuku
 
 import android.content.Context
 import android.content.pm.PackageManager
-import android.os.UserHandle
+import android.os.Process
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
@@ -189,7 +189,7 @@ object ShizukuBridge {
         if (match.find()) {
             val userId = match.group(1)?.toIntOrNull() ?: 0
             val appId = match.group(2)?.toIntOrNull() ?: return null
-            return (userId * 100_000) + UserHandle.FIRST_APPLICATION_UID + appId
+            return (userId * 100_000) + Process.FIRST_APPLICATION_UID + appId
         }
         return null
     }
