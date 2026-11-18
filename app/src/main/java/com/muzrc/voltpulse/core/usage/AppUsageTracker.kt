@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import com.muzrc.voltpulse.core.shizuku.ShizukuBridge
 import com.muzrc.voltpulse.data.local.entity.AppUsageEntity
 import com.muzrc.voltpulse.data.local.entity.BatteryLogEntity
 import java.util.Calendar
@@ -36,7 +37,8 @@ data class AppBatteryInsight(
     val peakHourRange: String,
     val peakHourMah: Float,
     val diagnosisTitle: String,
-    val recommendations: List<String>
+    val recommendations: List<String>,
+    val isShizukuSystemMeasured: Boolean = false
 )
 
 object AppUsageTracker {
@@ -136,7 +138,7 @@ object AppUsageTracker {
         }.sortedByDescending { it.estimatedMah }.take(30)
     }
 
-    fun analyzeDetailedAppUsage24h(
+    suspend fun analyzeDetailedAppUsage24h(
         context: Context,
         logs24h: List<BatteryLogEntity>,
         totalActualDrainMah: Float
@@ -148,7 +150,9 @@ object AppUsageTracker {
         val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val pm = context.packageManager
 
-        // 1. Dapatkan jumlah masa rasmi setiap aplikasi dalam 24 jam
+        val shizukuSystemMahMap = ShizukuBridge.readSystemBatteryStatsMah(context)
+        val hasShizukuData = shizukuSystemMahMap.isNotEmpty()
+
         val stats = usageStatsManager.queryUsageStats(
             UsageStatsManager.INTERVAL_BEST,
             startTime,
@@ -170,9 +174,14 @@ object AppUsageTracker {
             }
         }
 
+        for ((pkg, sysMah) in shizukuSystemMahMap) {
+            if (sysMah >= 2f && !totalTimesMap.containsKey(pkg)) {
+                totalTimesMap[pkg] = 0L to 60_000L
+            }
+        }
+
         if (totalTimesMap.isEmpty()) return emptyList()
 
-        // 2. Jejak peristiwa mengikut 24 slot jam menggunakan queryEvents
         val hourlyFgMs = mutableMapOf<String, LongArray>()
         val hourlyBgMs = mutableMapOf<String, LongArray>()
         val activeFgStart = mutableMapOf<String, Long>()
@@ -188,55 +197,33 @@ object AppUsageTracker {
 
                 val ts = event.timeStamp.coerceIn(startTime, endTime)
                 when (event.eventType) {
-                    UsageEvents.Event.ACTIVITY_RESUMED -> {
-                        activeFgStart[pkg] = ts
-                    }
+                    UsageEvents.Event.ACTIVITY_RESUMED -> activeFgStart[pkg] = ts
                     UsageEvents.Event.ACTIVITY_PAUSED,
                     UsageEvents.Event.ACTIVITY_STOPPED -> {
                         val started = activeFgStart.remove(pkg) ?: startTime
                         if (ts > started) {
-                            distributeDurationToSlots(
-                                map = hourlyFgMs,
-                                pkg = pkg,
-                                rangeStart = started,
-                                rangeEnd = ts,
-                                windowStart = startTime
-                            )
+                            distributeDurationToSlots(hourlyFgMs, pkg, started, ts, startTime)
                         }
                     }
-                    UsageEvents.Event.FOREGROUND_SERVICE_START -> {
-                        activeBgStart[pkg] = ts
-                    }
+                    UsageEvents.Event.FOREGROUND_SERVICE_START -> activeBgStart[pkg] = ts
                     UsageEvents.Event.FOREGROUND_SERVICE_STOP -> {
                         val started = activeBgStart.remove(pkg) ?: startTime
                         if (ts > started) {
-                            distributeDurationToSlots(
-                                map = hourlyBgMs,
-                                pkg = pkg,
-                                rangeStart = started,
-                                rangeEnd = ts,
-                                windowStart = startTime
-                            )
+                            distributeDurationToSlots(hourlyBgMs, pkg, started, ts, startTime)
                         }
                     }
                 }
             }
 
-            // Tutup sesi yang masih aktif sehingga waktu semasa (endTime)
             activeFgStart.forEach { (pkg, started) ->
-                if (endTime > started) {
-                    distributeDurationToSlots(hourlyFgMs, pkg, started, endTime, startTime)
-                }
+                if (endTime > started) distributeDurationToSlots(hourlyFgMs, pkg, started, endTime, startTime)
             }
             activeBgStart.forEach { (pkg, started) ->
-                if (endTime > started) {
-                    distributeDurationToSlots(hourlyBgMs, pkg, started, endTime, startTime)
-                }
+                if (endTime > started) distributeDurationToSlots(hourlyBgMs, pkg, started, endTime, startTime)
             }
         } catch (_: Exception) {
         }
 
-        // 3. Kira purata arus nyahcas (mA) untuk setiap 24 slot jam daripada log Room
         val slotCurrentMa = FloatArray(24) { 0f }
         val slotCounts = IntArray(24) { 0 }
         var globalDischargeSum = 0f
@@ -259,7 +246,6 @@ object AppUsageTracker {
             slotCurrentMa[i] = if (slotCounts[i] > 0) slotCurrentMa[i] / slotCounts[i] else fallbackMa
         }
 
-        // 4. Kira skor mentah setiap aplikasi dan selaraskan dengan jumlah sebenar mAh 24 jam
         val rawAppWeights = mutableMapOf<String, Double>()
         val rawSlotWeights = mutableMapOf<String, DoubleArray>()
 
@@ -272,18 +258,8 @@ object AppUsageTracker {
             val eventBgSum = bgSlots?.sum() ?: 0L
 
             for (s in 0 until 24) {
-                val fgMsInSlot = if (eventFgSum > 0L) {
-                    fgSlots!![s].toDouble()
-                } else {
-                    times.first / 24.0
-                }
-                val bgMsInSlot = if (eventBgSum > 0L) {
-                    bgSlots!![s].toDouble()
-                } else {
-                    times.second / 24.0
-                }
-
-                // Tenaga berkadar terus dengan masa * arus jam tersebut
+                val fgMsInSlot = if (eventFgSum > 0L) fgSlots!![s].toDouble() else times.first / 24.0
+                val bgMsInSlot = if (eventBgSum > 0L) bgSlots!![s].toDouble() else times.second / 24.0
                 val energyScore = ((fgMsInSlot * 1.0) + (bgMsInSlot * 0.35)) * slotCurrentMa[s]
                 slotWeights[s] = energyScore
             }
@@ -295,15 +271,27 @@ object AppUsageTracker {
         val grandTotalWeight = rawAppWeights.values.sum().coerceAtLeast(1.0)
         val effectivePoolMah = totalActualDrainMah.coerceAtLeast(10f)
 
+        val appFinalMahMap = mutableMapOf<String, Float>()
+        for ((pkg, _) in totalTimesMap) {
+            val sysMah = shizukuSystemMahMap[pkg]
+            if (hasShizukuData && sysMah != null && sysMah > 0.2f) {
+                appFinalMahMap[pkg] = sysMah
+            } else {
+                val share = ((rawAppWeights[pkg] ?: 0.0) / grandTotalWeight).toFloat()
+                appFinalMahMap[pkg] = effectivePoolMah * share
+            }
+        }
+
+        val totalDisplayedMah = appFinalMahMap.values.sum().coerceAtLeast(1f)
         val cal = Calendar.getInstance().apply { timeInMillis = startTime }
         val baseHour = cal.get(Calendar.HOUR_OF_DAY)
 
         return totalTimesMap.map { (pkg, times) ->
             val label = resolveAppLabel(pm, pkg)
-            val appWeight = rawAppWeights[pkg] ?: 0.0
-            val shareRatio = (appWeight / grandTotalWeight).toFloat()
-            val appTotalMah = effectivePoolMah * shareRatio
+            val appTotalMah = appFinalMahMap[pkg] ?: 0f
+            val pctOfTotal = (appTotalMah / totalDisplayedMah) * 100f
 
+            val appWeight = rawAppWeights[pkg] ?: 0.0
             val slotWeights = rawSlotWeights[pkg] ?: DoubleArray(24)
             val fgSlots = hourlyFgMs[pkg]
             val bgSlots = hourlyBgMs[pkg]
@@ -331,27 +319,30 @@ object AppUsageTracker {
                 String.format(Locale.US, "%02d:00 - %02d:00", it.hourOfDay, nextHour)
             } ?: "--"
 
+            val isShizukuMeasured = hasShizukuData && shizukuSystemMahMap.containsKey(pkg)
             val (diagTitle, adviceList) = generateDiagnostics(
                 packageName = pkg,
                 appLabel = label,
                 fgMs = times.first,
                 bgMs = times.second,
                 totalMah = appTotalMah,
-                hourlyList = hourlyList
+                hourlyList = hourlyList,
+                isShizukuMeasured = isShizukuMeasured
             )
 
             AppBatteryInsight(
                 packageName = pkg,
                 appLabel = label,
                 totalEstimatedMah = appTotalMah,
-                percentageOfTotalDrain = shareRatio * 100f,
+                percentageOfTotalDrain = pctOfTotal,
                 foregroundTimeMs = times.first,
                 backgroundTimeMs = times.second,
                 hourlyBreakdown = hourlyList,
                 peakHourRange = peakRange,
                 peakHourMah = peakSlot?.estimatedMah ?: 0f,
                 diagnosisTitle = diagTitle,
-                recommendations = adviceList
+                recommendations = adviceList,
+                isShizukuSystemMeasured = isShizukuMeasured
             )
         }.sortedByDescending { it.totalEstimatedMah }.take(35)
     }
@@ -380,7 +371,8 @@ object AppUsageTracker {
         fgMs: Long,
         bgMs: Long,
         totalMah: Float,
-        hourlyList: List<HourlyAppDrain>
+        hourlyList: List<HourlyAppDrain>,
+        isShizukuMeasured: Boolean
     ): Pair<String, List<String>> {
         val pkgLower = packageName.lowercase(Locale.US)
         val fgHours = fgMs / 3_600_000f
@@ -399,6 +391,9 @@ object AppUsageTracker {
                 pkgLower.contains("systemui")
 
         val tips = mutableListOf<String>()
+        if (isShizukuMeasured) {
+            tips.add("Bacaan mAh ini disahkan terus daripada enjin sistem Android (dumpsys batterystats: CPU, Modem & Wakelock).")
+        }
 
         return when {
             isNetworkOrSystemTool -> {
@@ -413,30 +408,29 @@ object AppUsageTracker {
 
             bgHours >= 4f || (bgRatio > 0.65f && totalMah > 80f) -> {
                 tips.add("Aplikasi kekal aktif di latar belakang selama ${String.format(Locale.US, "%.1f", bgHours)} jam walaupun skrin ditutup.")
-                tips.add("Buka Tetapan Aplikasi > Penggunaan Bateri dan pilih 'Terhad' (Restricted) untuk menyekat proses latar belakang.")
+                tips.add("Gunakan butang 'Sekat Latar Belakang (Shizuku)' di bawah atau tukar tetapan bateri aplikasi kepada 'Terhad' (Restricted).")
                 if (nightRatio > 0.25f) {
-                    tips.add("Sebanyak ${(nightRatio * 100).toInt()}% tenaga digunakan antara jam 12:00 tengah malam hingga 6:00 pagi. Masukkan aplikasi ke senarai 'Deep Sleep'.")
+                    tips.add("Sebanyak ${(nightRatio * 100).toInt()}% tenaga digunakan antara jam 12:00 tengah malam hingga 6:00 pagi.")
                 }
-                tips.add("Hadkan kebenaran Lokasi (GPS) kepada 'Semasa menggunakan aplikasi sahaja' dan matikan penyegerakan automatik yang tidak perlu.")
+                tips.add("Hadkan kebenaran Lokasi (GPS) kepada 'Semasa menggunakan aplikasi sahaja'.")
                 "Penggunaan Latar Belakang Tinggi" to tips
             }
 
             fgHours >= 1.5f -> {
                 tips.add("Penggunaan didominasi oleh skrin aktif (${String.format(Locale.US, "%.1f", fgHours)} jam) dan pemprosesan grafik/data.")
-                tips.add("Aktifkan Mod Gelap (Dark Mode) di dalam $appLabel untuk menjimatkan penggunaan kuasa skrin AMOLED.")
-                tips.add("Rendahkan kecerahan skrin atau gunakan Wi-Fi berbanding data mudah alih 4G/5G semasa sesi penggunaan panjang.")
+                tips.add("Aktifkan Mod Gelap (Dark Mode) di dalam $appLabel untuk menjimatkan kuasa skrin AMOLED.")
+                tips.add("Rendahkan kecerahan skrin atau gunakan Wi-Fi berbanding data mudah alih 4G/5G semasa sesi panjang.")
                 "Penggunaan Skrin Aktif Tinggi" to tips
             }
 
             nightRatio > 0.35f && totalMah > 40f -> {
                 tips.add("Aplikasi dikesan aktif pada waktu tidur (00:00 - 06:00) dan membangunkan peranti daripada mod Deep Sleep.")
-                tips.add("Aktifkan Mod Penjimatan Bateri berjadual pada waktu malam atau sekat aktiviti latar belakang aplikasi ini.")
+                tips.add("Sekat aktiviti latar belakang aplikasi ini sebelum tidur.")
                 "Aktiviti Latar Belakang Waktu Malam" to tips
             }
 
             else -> {
                 tips.add("Penggunaan bateri oleh $appLabel adalah terkawal dan seimbang dengan tempoh penggunaannya.")
-                tips.add("Tiada tindakan sekatan segera diperlukan.")
                 "Penggunaan Tenaga Normal" to tips
             }
         }

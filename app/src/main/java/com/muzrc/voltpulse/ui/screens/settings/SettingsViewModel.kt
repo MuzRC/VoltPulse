@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.muzrc.voltpulse.core.sensor.BatteryHealthCalculator
+import com.muzrc.voltpulse.core.shizuku.ShizukuBridge
+import com.muzrc.voltpulse.core.shizuku.ShizukuStatus
 import com.muzrc.voltpulse.core.updater.AppUpdateInfo
 import com.muzrc.voltpulse.core.updater.GitHubUpdateManager
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,6 +20,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     )
     val designCapacity: StateFlow<String> = _designCapacity.asStateFlow()
 
+    private val _shizukuStatus = MutableStateFlow(ShizukuBridge.getStatus(application))
+    val shizukuStatus: StateFlow<ShizukuStatus> = _shizukuStatus.asStateFlow()
+
+    private val _kernelHardwareSummary = MutableStateFlow<String?>(null)
+    val kernelHardwareSummary: StateFlow<String?> = _kernelHardwareSummary.asStateFlow()
+
     private val _updateStatusMessage = MutableStateFlow<String?>(null)
     val updateStatusMessage: StateFlow<String?> = _updateStatusMessage.asStateFlow()
 
@@ -26,6 +34,37 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     private val _isCheckingUpdate = MutableStateFlow(false)
     val isCheckingUpdate: StateFlow<Boolean> = _isCheckingUpdate.asStateFlow()
+
+    init {
+        refreshShizukuStatus()
+    }
+
+    fun refreshShizukuStatus() {
+        val ctx = getApplication<Application>()
+        val status = ShizukuBridge.getStatus(ctx)
+        _shizukuStatus.value = status
+
+        if (status == ShizukuStatus.READY) {
+            viewModelScope.launch {
+                val hw = ShizukuBridge.readKernelBatteryHardware(ctx)
+                val parts = mutableListOf<String>()
+                hw.chargeFullMah?.let { parts.add("Kapasiti Penuh CIP: ${it.toInt()} mAh") }
+                hw.chargeFullDesignMah?.let { parts.add("Reka Bentuk Kilang: ${it.toInt()} mAh") }
+                hw.cycleCount?.let { parts.add("Kitaran Cas: $it") }
+                _kernelHardwareSummary.value = if (parts.isNotEmpty()) {
+                    parts.joinToString(" • ")
+                } else {
+                    "Shizuku aktif (Enjin dumpsys batterystats sedia)"
+                }
+            }
+        } else {
+            _kernelHardwareSummary.value = null
+        }
+    }
+
+    fun requestShizukuPermission() {
+        ShizukuBridge.requestPermission()
+    }
 
     fun updateDesignCapacityInput(value: String) {
         _designCapacity.value = value.filter { it.isDigit() }

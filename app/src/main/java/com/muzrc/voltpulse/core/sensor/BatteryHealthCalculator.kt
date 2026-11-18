@@ -2,6 +2,7 @@ package com.muzrc.voltpulse.core.sensor
 
 import android.annotation.SuppressLint
 import android.content.Context
+import com.muzrc.voltpulse.core.shizuku.KernelBatteryHardwareInfo
 import com.muzrc.voltpulse.data.local.entity.BatteryHealthEntity
 import com.muzrc.voltpulse.data.local.entity.BatteryLogEntity
 import kotlin.math.abs
@@ -14,7 +15,9 @@ data class BatteryEstimates(
     val remainingSotHours: Float,
     val remainingStandbyHours: Float,
     val remainingCombinedHours: Float,
-    val internalResistanceMohm: Float?
+    val internalResistanceMohm: Float?,
+    val isKernelHardwareVerified: Boolean = false,
+    val kernelCycleCount: Int? = null
 )
 
 object BatteryHealthCalculator {
@@ -32,7 +35,7 @@ object BatteryHealthCalculator {
             prefs.edit().putFloat(KEY_DESIGN_CAPACITY, systemCapacity).apply()
             return systemCapacity
         }
-        return 5000f // Nilai lalai standard jika pengeluar menyekat PowerProfile
+        return 5000f
     }
 
     fun setManualDesignCapacityMah(context: Context, capacityMah: Float) {
@@ -58,9 +61,6 @@ object BatteryHealthCalculator {
         }
     }
 
-    /**
-     * Formula 1A: Integrasi Arus (Coulomb Counting) daripada log pengecasan sah.
-     */
     fun calculateCoulombCountedCapacity(
         chargeLogs: List<BatteryLogEntity>,
         startLevel: Int,
@@ -85,9 +85,6 @@ object BatteryHealthCalculator {
         return if (estimatedFullMah in 500.0..20000.0) estimatedFullMah.toFloat() else null
     }
 
-    /**
-     * Formula 1B: Bacaan Perkakasan Terus daripada CHARGE_COUNTER (uAh).
-     */
     fun calculateHardwareCounterCapacity(chargeCounterUah: Long, currentLevel: Int): Float? {
         if (chargeCounterUah <= 0L || currentLevel !in 5..100) return null
         val remainingMah = chargeCounterUah / 1000f
@@ -95,9 +92,6 @@ object BatteryHealthCalculator {
         return if (fullMah in 500f..20000f) fullMah else null
     }
 
-    /**
-     * Formula 2: Penstabilan Median Kesihatan Bateri daripada rekod sesi terdahulu.
-     */
     fun calculateMedianCapacity(
         healthHistory: List<BatteryHealthEntity>,
         fallbackHardwareCapacity: Float?,
@@ -120,9 +114,6 @@ object BatteryHealthCalculator {
         return fallbackHardwareCapacity ?: designCapacity
     }
 
-    /**
-     * Formula 4: Rintangan Dalaman (mOhm) menggunakan Hukum Ohm semasa lonjakan beban.
-     */
     fun estimateInternalResistanceMohm(recentLogs: List<BatteryLogEntity>): Float? {
         if (recentLogs.size < 2) return null
         for (i in recentLogs.size - 1 downTo 1) {
@@ -143,20 +134,21 @@ object BatteryHealthCalculator {
         return null
     }
 
-    /**
-     * Formula 3: Pengiraan Lengkap Baki SOT, Standby, dan Gabungan.
-     */
     fun computeAllEstimates(
         snapshot: BatteryTelemetrySnapshot,
         designCapacityMah: Float,
         healthHistory: List<BatteryHealthEntity>,
         avgActiveMa: Float?,
         avgStandbyMa: Float?,
-        recentLogs: List<BatteryLogEntity>
+        recentLogs: List<BatteryLogEntity>,
+        kernelInfo: KernelBatteryHardwareInfo = KernelBatteryHardwareInfo()
     ): BatteryEstimates {
+        val effectiveDesignCap = kernelInfo.chargeFullDesignMah ?: designCapacityMah
         val hwCap = calculateHardwareCounterCapacity(snapshot.chargeCounterUah, snapshot.level)
-        val actualCap = calculateMedianCapacity(healthHistory, hwCap, designCapacityMah)
-        val healthPct = ((actualCap / designCapacityMah) * 100f).coerceIn(1f, 110f)
+        val actualCap = kernelInfo.chargeFullMah
+            ?: calculateMedianCapacity(healthHistory, hwCap, effectiveDesignCap)
+
+        val healthPct = ((actualCap / effectiveDesignCap) * 100f).coerceIn(1f, 110f)
 
         val remainingMah = if (snapshot.chargeCounterUah > 0L) {
             snapshot.chargeCounterUah / 1000f
@@ -172,7 +164,6 @@ object BatteryHealthCalculator {
         val sotHours = remainingMah / activeDrainMa
         val standbyHours = remainingMah / standbyDrainMa
 
-        // Nisbah corak penggunaan standard 25% aktif / 75% melahu
         val combinedDrainMa = (0.25f * activeDrainMa) + (0.75f * standbyDrainMa)
         val combinedHours = remainingMah / combinedDrainMa
 
@@ -181,13 +172,15 @@ object BatteryHealthCalculator {
 
         return BatteryEstimates(
             actualCapacityMah = actualCap,
-            designCapacityMah = designCapacityMah,
+            designCapacityMah = effectiveDesignCap,
             healthPercentage = healthPct,
             remainingCapacityMah = remainingMah,
             remainingSotHours = sotHours,
             remainingStandbyHours = standbyHours,
             remainingCombinedHours = combinedHours,
-            internalResistanceMohm = resistance
+            internalResistanceMohm = resistance,
+            isKernelHardwareVerified = kernelInfo.chargeFullMah != null,
+            kernelCycleCount = kernelInfo.cycleCount ?: snapshot.cycleCount.takeIf { it >= 0 }
         )
     }
 }

@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.muzrc.voltpulse.core.sensor.BatteryHealthCalculator
 import com.muzrc.voltpulse.core.sensor.BatteryTelemetryManager
+import com.muzrc.voltpulse.core.shizuku.ShizukuBridge
 import com.muzrc.voltpulse.core.usage.AppBatteryInsight
 import com.muzrc.voltpulse.core.usage.AppUsageTracker
 import com.muzrc.voltpulse.data.local.VoltPulseDatabase
@@ -18,6 +19,7 @@ import kotlin.math.abs
 
 data class AppUsageUiState(
     val hasPermission: Boolean = false,
+    val isShizukuActive: Boolean = false,
     val isLoading: Boolean = true,
     val totalDrainMah: Float = 0f,
     val totalDrainPercentOfBattery: Float = 0f,
@@ -25,6 +27,7 @@ data class AppUsageUiState(
     val backgroundDrainMah: Float = 0f,
     val appInsights: List<AppBatteryInsight> = emptyList(),
     val selectedApp: AppBatteryInsight? = null,
+    val actionFeedbackMessage: String? = null,
     val lastUpdatedTimestamp: Long = System.currentTimeMillis()
 )
 
@@ -34,7 +37,10 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
     private val telemetryManager = BatteryTelemetryManager(application)
 
     private val _uiState = MutableStateFlow(
-        AppUsageUiState(hasPermission = AppUsageTracker.hasUsageStatsPermission(application))
+        AppUsageUiState(
+            hasPermission = AppUsageTracker.hasUsageStatsPermission(application),
+            isShizukuActive = ShizukuBridge.isReady(application)
+        )
     )
     val uiState: StateFlow<AppUsageUiState> = _uiState.asStateFlow()
 
@@ -43,17 +49,49 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun selectApp(insight: AppBatteryInsight?) {
-        _uiState.update { it.copy(selectedApp = insight) }
+        _uiState.update { it.copy(selectedApp = insight, actionFeedbackMessage = null) }
+    }
+
+    fun restrictAppWithShizuku(packageName: String, appLabel: String) {
+        viewModelScope.launch {
+            val ok = ShizukuBridge.restrictBackgroundViaShizuku(getApplication(), packageName)
+            _uiState.update {
+                it.copy(
+                    actionFeedbackMessage = if (ok) {
+                        "Berjaya menyekat proses latar belakang untuk $appLabel."
+                    } else {
+                        "Gagal melaksanakan arahan Shizuku. Pastikan servis Shizuku aktif."
+                    }
+                )
+            }
+        }
+    }
+
+    fun forceStopAppWithShizuku(packageName: String, appLabel: String) {
+        viewModelScope.launch {
+            val ok = ShizukuBridge.forceStopViaShizuku(getApplication(), packageName)
+            _uiState.update {
+                it.copy(
+                    actionFeedbackMessage = if (ok) {
+                        "$appLabel telah dihentikan paksa (Force Stopped)."
+                    } else {
+                        "Gagal menghentikan $appLabel melalui Shizuku."
+                    }
+                )
+            }
+        }
     }
 
     fun refreshData() {
         val ctx = getApplication<Application>()
         val granted = AppUsageTracker.hasUsageStatsPermission(ctx)
+        val shizukuReady = ShizukuBridge.isReady(ctx)
 
         if (!granted) {
             _uiState.update {
                 it.copy(
                     hasPermission = false,
+                    isShizukuActive = shizukuReady,
                     isLoading = false,
                     appInsights = emptyList()
                 )
@@ -62,26 +100,23 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            _uiState.update { it.copy(hasPermission = true, isLoading = true) }
+            _uiState.update { it.copy(hasPermission = true, isShizukuActive = shizukuReady, isLoading = true) }
 
             val now = System.currentTimeMillis()
             val since24h = now - 86_400_000L
             val logs24h = dao.getLogsSinceSync(since24h)
             val healthHistory = dao.getRecentHealthRecordsSync()
             val snapshot = telemetryManager.readCurrentSnapshot()
+            val kernelInfo = ShizukuBridge.readKernelBatteryHardware(ctx)
 
             val designCap = BatteryHealthCalculator.getDesignCapacityMah(ctx)
             val hwCap = BatteryHealthCalculator.calculateHardwareCounterCapacity(
                 snapshot.chargeCounterUah,
                 snapshot.level
             )
-            val actualCap = BatteryHealthCalculator.calculateMedianCapacity(
-                healthHistory,
-                hwCap,
-                designCap
-            )
+            val actualCap = kernelInfo.chargeFullMah
+                ?: BatteryHealthCalculator.calculateMedianCapacity(healthHistory, hwCap, designCap)
 
-            // 1. Kira jumlah mAh nyahcas sebenar daripada log telemetri 24 jam
             var integratedDischargeMah = 0.0
             var levelDropDischargeMah = 0.0
 
@@ -101,7 +136,6 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
                 }
             }
 
-            // Gunakan nilai paling realistik berdasarkan rekod semasa
             val realTotalDrainMah = maxOf(
                 integratedDischargeMah.toFloat(),
                 levelDropDischargeMah.toFloat(),
@@ -117,7 +151,6 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
             val sumAppsMah = insights.sumOf { it.totalEstimatedMah.toDouble() }.toFloat()
             val displayTotalMah = if (sumAppsMah > 1f) sumAppsMah else realTotalDrainMah
 
-            // Pecahan anggaran antara skrin aktif dan latar belakang
             var screenWeightedSum = 0.0
             var bgWeightedSum = 0.0
             for (app in insights) {
@@ -136,6 +169,7 @@ class AppUsageViewModel(application: Application) : AndroidViewModel(application
                 }
                 current.copy(
                     hasPermission = true,
+                    isShizukuActive = shizukuReady,
                     isLoading = false,
                     totalDrainMah = displayTotalMah,
                     totalDrainPercentOfBattery = drainPercent,

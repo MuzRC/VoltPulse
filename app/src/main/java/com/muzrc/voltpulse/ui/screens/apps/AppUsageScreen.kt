@@ -23,8 +23,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Lightbulb
+import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
@@ -37,6 +39,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -94,7 +97,6 @@ fun AppUsageScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Auto-kemas kini setiap 30 saat semasa pengguna berada di tab Aplikasi
     LaunchedEffect(uiState.hasPermission) {
         if (uiState.hasPermission) {
             while (true) {
@@ -113,6 +115,20 @@ fun AppUsageScreen(
         ) {
             AppDetailBottomSheetContent(
                 insight = selectedInsight,
+                isShizukuActive = uiState.isShizukuActive,
+                feedbackMessage = uiState.actionFeedbackMessage,
+                onRestrictShizuku = {
+                    viewModel.restrictAppWithShizuku(
+                        selectedInsight.packageName,
+                        selectedInsight.appLabel
+                    )
+                },
+                onForceStopShizuku = {
+                    viewModel.forceStopAppWithShizuku(
+                        selectedInsight.packageName,
+                        selectedInsight.appLabel
+                    )
+                },
                 onOpenAppSettings = {
                     AppUsageTracker.openAppInfoSettings(context, selectedInsight.packageName)
                 }
@@ -229,28 +245,45 @@ private fun TotalUsageSummaryCard(uiState: AppUsageUiState) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Text(
+                    text = "JUMLAH PENGGUNAAN BATERI (24 JAM)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (uiState.isShizukuActive) ChargeGreen.copy(alpha = 0.16f) else DarkOutline
+                ) {
                     Text(
-                        text = "JUMLAH PENGGUNAAN BATERI (24 JAM)",
+                        text = if (uiState.isShizukuActive) "MOD SHIZUKU" else "MOD STANDARD",
                         style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary
+                        color = if (uiState.isShizukuActive) ChargeGreen else TextSecondary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        Text(
-                            text = String.format(Locale.US, "~%.0f mAh", uiState.totalDrainMah),
-                            style = MaterialTheme.typography.displayMedium,
-                            color = ElectricCyan
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = String.format(Locale.US, "(%.1f%% kapasiti)", uiState.totalDrainPercentOfBattery),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = DischargeAmber,
-                            modifier = Modifier.padding(bottom = 6.dp)
-                        )
-                    }
                 }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    text = String.format(
+                        Locale.US,
+                        "%s%.0f mAh",
+                        if (uiState.isShizukuActive) "" else "~",
+                        uiState.totalDrainMah
+                    ),
+                    style = MaterialTheme.typography.displayMedium,
+                    color = ElectricCyan
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = String.format(Locale.US, "(%.1f%% kapasiti)", uiState.totalDrainPercentOfBattery),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = DischargeAmber,
+                    modifier = Modifier.padding(bottom = 6.dp)
+                )
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -361,11 +394,23 @@ private fun AppUsageRowCard(
 
             Column(horizontalAlignment = Alignment.End) {
                 Text(
-                    text = String.format(Locale.US, "~%.0f mAh", insight.totalEstimatedMah),
+                    text = String.format(
+                        Locale.US,
+                        "%s%.0f mAh",
+                        if (insight.isShizukuSystemMeasured) "" else "~",
+                        insight.totalEstimatedMah
+                    ),
                     style = MaterialTheme.typography.titleMedium,
                     color = DischargeAmber,
                     fontWeight = FontWeight.Bold
                 )
+                if (insight.isShizukuSystemMeasured) {
+                    Text(
+                        text = "Sistem",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ChargeGreen
+                    )
+                }
             }
         }
     }
@@ -374,6 +419,10 @@ private fun AppUsageRowCard(
 @Composable
 private fun AppDetailBottomSheetContent(
     insight: AppBatteryInsight,
+    isShizukuActive: Boolean,
+    feedbackMessage: String?,
+    onRestrictShizuku: () -> Unit,
+    onForceStopShizuku: () -> Unit,
     onOpenAppSettings: () -> Unit
 ) {
     val fgHours = insight.foregroundTimeMs / 3_600_000f
@@ -385,7 +434,6 @@ private fun AppDetailBottomSheetContent(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 8.dp)
     ) {
-        // 1. Tajuk & Ringkasan Aplikasi
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -405,7 +453,12 @@ private fun AppDetailBottomSheetContent(
             }
             Column(horizontalAlignment = Alignment.End) {
                 Text(
-                    text = String.format(Locale.US, "~%.0f mAh", insight.totalEstimatedMah),
+                    text = String.format(
+                        Locale.US,
+                        "%s%.0f mAh",
+                        if (insight.isShizukuSystemMeasured) "" else "~",
+                        insight.totalEstimatedMah
+                    ),
                     style = MaterialTheme.typography.headlineSmall,
                     color = DischargeAmber
                 )
@@ -419,7 +472,6 @@ private fun AppDetailBottomSheetContent(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // 2. Pecahan Masa & Waktu Puncak
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
@@ -468,7 +520,6 @@ private fun AppDetailBottomSheetContent(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 3. Carta Bar Penggunaan Mengikut Jam (24 Jam)
         Text(
             text = "PECAHAN PENGGUNAAN MENGIKUT JAM (24 JAM)",
             style = MaterialTheme.typography.labelSmall,
@@ -547,7 +598,6 @@ private fun AppDetailBottomSheetContent(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 4. Diagnosis & Cadangan Membaiki Penggunaan Bateri
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
@@ -592,25 +642,70 @@ private fun AppDetailBottomSheetContent(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // 5. Butang Tindakan Terus ke Tetapan Sistem Aplikasi
-        Button(
+        feedbackMessage?.let { msg ->
+            Text(
+                text = msg,
+                style = MaterialTheme.typography.bodyMedium,
+                color = ChargeGreen,
+                modifier = Modifier.padding(bottom = 10.dp)
+            )
+        }
+
+        if (isShizukuActive) {
+            Button(
+                onClick = onRestrictShizuku,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ChargeGreen,
+                    contentColor = AmoledBlack
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Block,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Sekat Latar Belakang Terus (Shizuku)")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = onForceStopShizuku,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, OverheatRed)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.PowerSettingsNew,
+                    contentDescription = null,
+                    tint = OverheatRed,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Henti Paksa Aplikasi (Force Stop)", color = OverheatRed)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
+        OutlinedButton(
             onClick = onOpenAppSettings,
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = ElectricCyan,
-                contentColor = AmoledBlack
-            ),
             shape = RoundedCornerShape(12.dp)
         ) {
             Icon(
                 imageVector = Icons.Outlined.Settings,
                 contentDescription = null,
+                tint = ElectricCyan,
                 modifier = Modifier.size(18.dp)
             )
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Buka Tetapan Aplikasi (Sekat Latar Belakang / Force Stop)")
+            Text("Buka Tetapan Aplikasi Sistem", color = ElectricCyan)
         }
 
         Spacer(modifier = Modifier.height(24.dp))

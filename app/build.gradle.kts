@@ -76,4 +76,8 @@ dependencies {
 
     // Tugas Penyelenggaraan Latar Belakang
     implementation(libs.androidx.work.runtime.ktx)
+
+    // Integrasi Mod Hibrid Shizuku
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
 }

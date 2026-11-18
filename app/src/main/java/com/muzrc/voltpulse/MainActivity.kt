@@ -10,8 +10,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import com.muzrc.voltpulse.core.shizuku.ShizukuBridge
 import com.muzrc.voltpulse.ui.navigation.VoltPulseMainScaffold
 import com.muzrc.voltpulse.ui.theme.VoltPulseTheme
+import rikka.shizuku.Shizuku
 
 class MainActivity : ComponentActivity() {
 
@@ -21,8 +23,19 @@ class MainActivity : ComponentActivity() {
         (application as? VoltPulseApp)?.startMonitorServiceSafely()
     }
 
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == ShizukuBridge.REQUEST_CODE_SHIZUKU && grantResult == PackageManager.PERMISSION_GRANTED) {
+            // Kebenaran Shizuku berjaya diberikan
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        try {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+        } catch (_: Exception) {
+        }
 
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.BLACK),
@@ -36,6 +49,14 @@ class MainActivity : ComponentActivity() {
                 VoltPulseMainScaffold()
             }
         }
+    }
+
+    override fun onDestroy() {
+        try {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
     }
 
     private fun requestNotificationPermissionIfNeeded() {
